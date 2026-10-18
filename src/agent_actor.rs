@@ -4,7 +4,9 @@
 use actix::prelude::*;
 use rig_agent::completion::{Message, PromptError};
 use rig_agent::{Agent, AgentBuilder};
-use rig_core::providers::ollama::Ollama;
+use rig_core::providers::ollama::OllamaConfig;
+
+use crate::config::AppConfig;
 
 /// Message envoyé à l'acteur : une question de l'utilisateur.
 #[derive(Message)]
@@ -18,10 +20,11 @@ pub struct AgentActor {
 }
 
 impl AgentActor {
-    /// Construit l'agent sur le modèle Ollama donné (serveur local localhost:11434).
-    pub fn new(model: &str, preamble: &str) -> Self {
-        let agent = AgentBuilder::new(Ollama::new().completion(model))
-            .preamble(preamble)
+    /// Construit l'agent à partir du serveur, du modèle et du préambule de `cfg`.
+    pub fn new(cfg: &AppConfig) -> Self {
+        let ollama = OllamaConfig::new().with_base_url(&cfg.ollama_url).client();
+        let agent = AgentBuilder::new(ollama.completion(&cfg.model))
+            .preamble(&cfg.preamble)
             .build();
         Self {
             agent,

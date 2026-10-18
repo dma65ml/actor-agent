@@ -8,6 +8,8 @@ mod agent_actor;
 mod cli_ui;
 mod config;
 mod proxy;
+#[cfg(test)]
+mod test_support;
 mod web_ui;
 
 use actix::Actor;
@@ -15,8 +17,7 @@ use config::{AppConfig, ConfigActor, Ui};
 use proxy::ProxyAgent;
 
 /// Déduit l'interface des drapeaux CLI, sinon garde celle de la configuration.
-fn ui_from_args(default: Ui) -> Ui {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn ui_from_args(args: &[String], default: Ui) -> Ui {
     let has = |flag| args.iter().any(|a| a == flag);
     match (has("--cli"), has("--web")) {
         (true, true) => Ui::Both,
@@ -33,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Configuration : {e}");
         std::process::exit(1)
     });
-    let ui = ui_from_args(cfg.ui);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let ui = ui_from_args(&args, cfg.ui);
     let addr = cfg.web_addr.clone();
     let config = ConfigActor::new(cfg).start();
     let proxy = ProxyAgent::new(config.clone()).start();
@@ -51,4 +53,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lit les drapeaux d'une ligne de commande simulée.
+    fn ui(args: &[&str], default: Ui) -> Ui {
+        ui_from_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>(), default)
+    }
+
+    /// Les drapeaux priment sur la configuration ; sans drapeau, elle s'applique.
+    #[test]
+    fn flags_override_config() {
+        assert_eq!(ui(&["--cli"], Ui::Web), Ui::Cli);
+        assert_eq!(ui(&["--web"], Ui::Cli), Ui::Web);
+        assert_eq!(ui(&["--web", "--cli"], Ui::Cli), Ui::Both);
+        assert_eq!(ui(&[], Ui::Web), Ui::Web);
+    }
 }
