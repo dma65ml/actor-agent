@@ -2,11 +2,13 @@
 //!
 //! - `POST /chat` `{ "session_id": "...", "content": "..." }` → `{ "session_id": "...", "response": "..." }`
 //! - `DELETE /sessions/{session_id}` → 204, efface l'historique de la session.
+//! - `GET /config` → configuration courante ; `PATCH /config` `{"model": "..."}` ou `{"preamble": "..."}`.
 
 use actix::Addr;
 use actix_web::{App, HttpResponse, HttpServer, ResponseError, dev::Server, http::StatusCode, web};
 use serde::{Deserialize, Serialize};
 
+use crate::config::{AppConfig, ConfigActor, GetConfig, UpdateConfig};
 use crate::proxy::{ClearSession, ProxyAgent, ProxyError, ask};
 
 /// Corps de la requête `POST /chat`.
@@ -52,14 +54,30 @@ async fn clear(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// Renvoie la configuration courante.
+async fn get_config(config: web::Data<Addr<ConfigActor>>) -> Result<web::Json<AppConfig>, ProxyError> {
+    Ok(web::Json(config.send(GetConfig).await?))
+}
+
+/// Modifie un paramètre à chaud (pris en compte par les sessions créées ensuite).
+async fn update_config(
+    config: web::Data<Addr<ConfigActor>>,
+    change: web::Json<UpdateConfig>,
+) -> Result<web::Json<AppConfig>, ProxyError> {
+    Ok(web::Json(config.send(change.into_inner()).await?))
+}
+
 /// Construit le serveur HTTP lié à `addr` ; l'appelant l'attend ou le lance en tâche de fond.
-pub fn server(proxy: Addr<ProxyAgent>, addr: &str) -> std::io::Result<Server> {
-    let proxy = web::Data::new(proxy);
+pub fn server(proxy: Addr<ProxyAgent>, config: Addr<ConfigActor>, addr: &str) -> std::io::Result<Server> {
+    let (proxy, config) = (web::Data::new(proxy), web::Data::new(config));
     Ok(HttpServer::new(move || {
         App::new()
             .app_data(proxy.clone())
+            .app_data(config.clone())
             .route("/chat", web::post().to(chat))
             .route("/sessions/{session_id}", web::delete().to(clear))
+            .route("/config", web::get().to(get_config))
+            .route("/config", web::patch().to(update_config))
     })
     .bind(addr)?
     .run())

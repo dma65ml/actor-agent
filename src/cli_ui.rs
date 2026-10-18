@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+use crate::config::{ConfigActor, UpdateConfig};
 use crate::proxy::{ClearSession, ProxyAgent, ProxyError, ask};
 
 /// Session unique utilisée par le terminal.
@@ -21,11 +22,13 @@ enum Role {
     User,
     Agent,
     Error,
+    System,
 }
 
 /// État de l'interface.
 struct App {
     proxy: Addr<ProxyAgent>,
+    config: Addr<ConfigActor>,
     replies: UnboundedSender<Result<String, ProxyError>>,
     history: Vec<(Role, String)>,
     input: String,
@@ -35,18 +38,22 @@ struct App {
 }
 
 /// Lance le TUI jusqu'à Échap / Ctrl+C ; le terminal est restauré même en cas d'erreur.
-pub async fn run(proxy: Addr<ProxyAgent>) -> std::io::Result<()> {
+pub async fn run(proxy: Addr<ProxyAgent>, config: Addr<ConfigActor>) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
-    let res = event_loop(&mut terminal, proxy).await;
+    let res = event_loop(&mut terminal, proxy, config).await;
     ratatui::restore();
     res
 }
 
 /// Boucle principale : dessine, puis attend une touche ou une réponse de l'agent.
-async fn event_loop(terminal: &mut DefaultTerminal, proxy: Addr<ProxyAgent>) -> std::io::Result<()> {
+async fn event_loop(
+    terminal: &mut DefaultTerminal,
+    proxy: Addr<ProxyAgent>,
+    config: Addr<ConfigActor>,
+) -> std::io::Result<()> {
     let mut keys = spawn_input_thread();
     let (replies, mut reply_rx) = unbounded_channel();
-    let mut app = App { proxy, replies, history: Vec::new(), input: String::new(), busy: false, scroll_up: 0 };
+    let mut app = App { proxy, config, replies, history: Vec::new(), input: String::new(), busy: false, scroll_up: 0 };
     loop {
         terminal.draw(|f| app.draw(f))?;
         tokio::select! {
@@ -93,7 +100,8 @@ impl App {
         true
     }
 
-    /// Envoie la saisie à l'agent en tâche de fond (ou efface la session sur `/clear`).
+    /// Envoie la saisie à l'agent en tâche de fond, ou exécute une commande :
+    /// `/clear`, `/model <nom>`, `/preamble <texte>`.
     fn submit(&mut self) {
         let content = self.input.trim().to_owned();
         if content.is_empty() || self.busy {
@@ -104,6 +112,17 @@ impl App {
         if content == "/clear" {
             self.proxy.do_send(ClearSession { session_id: SESSION_ID.into() });
             self.history.clear();
+            return;
+        }
+        let change = match content.split_once(' ') {
+            Some(("/model", v)) => Some(UpdateConfig::Model(v.trim().into())),
+            Some(("/preamble", v)) => Some(UpdateConfig::Preamble(v.trim().into())),
+            _ => None,
+        };
+        if let Some(change) = change {
+            self.config.do_send(change);
+            let note = format!("{content} appliqué aux nouvelles sessions (/clear pour l'utiliser ici).");
+            self.history.push((Role::System, note));
             return;
         }
         self.history.push((Role::User, content.clone()));
@@ -136,6 +155,7 @@ impl App {
                 Role::User => ("Vous", Color::Cyan),
                 Role::Agent => ("Agent", Color::Green),
                 Role::Error => ("Erreur", Color::Red),
+                Role::System => ("Système", Color::DarkGray),
             };
             lines.push(Line::styled(label, Style::new().fg(color).bold()));
             lines.extend(text.lines().map(Line::raw));
@@ -151,7 +171,7 @@ impl App {
         f.render_widget(history.scroll((top, 0)), hist_area);
 
         let input = Paragraph::new(self.input.as_str())
-            .block(Block::bordered().title(" Message — Entrée : envoyer · /clear · Échap : quitter "));
+            .block(Block::bordered().title(" Message — Entrée : envoyer · /clear · /model · /preamble · Échap : quitter "));
         f.render_widget(input, input_area);
         // ponytail: curseur placé au nombre de caractères, faux pour les glyphes larges (CJK, emoji).
         let col = u16::try_from(self.input.chars().count()).unwrap_or(u16::MAX);

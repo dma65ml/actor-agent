@@ -8,6 +8,7 @@ use actix::prelude::*;
 use rig_agent::completion::PromptError;
 
 use crate::agent_actor::{AgentActor, Ask};
+use crate::config::{ConfigActor, GetConfig};
 
 /// Durée maximale accordée à l'agent pour répondre.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -58,19 +59,14 @@ pub struct ClearSession {
 
 /// Routeur des sessions vers leurs agents dédiés.
 pub struct ProxyAgent {
-    model: String,
-    preamble: String,
+    config: Addr<ConfigActor>,
     sessions: HashMap<String, Addr<AgentActor>>,
 }
 
 impl ProxyAgent {
-    /// Crée un proxy dont les agents utiliseront ce modèle Ollama et ce préambule.
-    pub fn new(model: impl Into<String>, preamble: impl Into<String>) -> Self {
-        Self {
-            model: model.into(),
-            preamble: preamble.into(),
-            sessions: HashMap::new(),
-        }
+    /// Crée un proxy qui lira modèle et préambule auprès de `config` à chaque nouvelle session.
+    pub fn new(config: Addr<ConfigActor>) -> Self {
+        Self { config, sessions: HashMap::new() }
     }
 }
 
@@ -79,17 +75,31 @@ impl Actor for ProxyAgent {
 }
 
 impl Handler<SendMessage> for ProxyAgent {
-    type Result = ResponseFuture<Result<String, ProxyError>>;
+    type Result = ResponseActFuture<Self, Result<String, ProxyError>>;
 
-    /// Route le prompt vers l'agent de la session ; le proxy n'attend pas la réponse,
-    /// il reste donc disponible pour les autres sessions pendant la génération.
+    /// Récupère la configuration à jour, crée l'agent si la session est nouvelle,
+    /// puis attend sa réponse sans bloquer le proxy pour les autres sessions.
+    /// Un changement de modèle ne s'applique donc qu'aux sessions créées ensuite.
     fn handle(&mut self, msg: SendMessage, _ctx: &mut Self::Context) -> Self::Result {
-        let agent = self
-            .sessions
-            .entry(msg.session_id)
-            .or_insert_with(|| AgentActor::new(&self.model, &self.preamble).start())
-            .clone();
-        Box::pin(async move { Ok(agent.send(Ask(msg.content)).timeout(ANSWER_TIMEOUT).await??) })
+        let SendMessage { session_id, content } = msg;
+        let config = self.config.clone();
+        // ponytail: config relue à chaque message (aller-retour local négligeable face au LLM) ;
+        // l'insertion se fait dans le contexte de l'acteur, donc sans course entre messages.
+        Box::pin(
+            async move { config.send(GetConfig).await }
+                .into_actor(self)
+                .map(|cfg, act, _| -> Result<_, ProxyError> {
+                    let cfg = cfg?;
+                    Ok(act
+                        .sessions
+                        .entry(session_id)
+                        .or_insert_with(|| AgentActor::new(&cfg.model, &cfg.preamble).start())
+                        .clone())
+                })
+                .then(|agent, act, _| {
+                    async move { Ok(agent?.send(Ask(content)).timeout(ANSWER_TIMEOUT).await??) }.into_actor(act)
+                }),
+        )
     }
 }
 

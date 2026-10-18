@@ -1,43 +1,54 @@
-//! Point d'entrée : démarre le `ProxyAgent` puis l'interface choisie.
+//! Point d'entrée : charge la configuration, démarre `ConfigActor` et `ProxyAgent`,
+//! puis lance l'interface choisie.
 //!
-//! Usage : `actor-agent [--cli] [--web]` (défaut : `--cli` ; les deux drapeaux = les deux en parallèle).
-//! Variables : `OLLAMA_MODEL` (défaut `llama3.2`), `WEB_ADDR` (défaut `127.0.0.1:8080`).
+//! Usage : `actor-agent [--cli] [--web]` ; les drapeaux priment sur `APP_UI` / `config.toml`
+//! (les deux drapeaux = les deux interfaces en parallèle).
 
 mod agent_actor;
 mod cli_ui;
+mod config;
 mod proxy;
 mod web_ui;
 
 use actix::Actor;
+use config::{AppConfig, ConfigActor, Ui};
 use proxy::ProxyAgent;
 
-/// Modèle Ollama utilisé par défaut.
-const DEFAULT_MODEL: &str = "llama3.2";
-/// Adresse d'écoute par défaut de l'API Web.
-const DEFAULT_WEB_ADDR: &str = "127.0.0.1:8080";
-/// Consigne système commune à tous les agents.
-const PREAMBLE: &str = "Tu es un assistant concis. Réponds en français.";
-
-/// Lit les drapeaux, démarre le proxy et lance la ou les interfaces.
-#[actix::main]
-async fn main() -> std::io::Result<()> {
+/// Déduit l'interface des drapeaux CLI, sinon garde celle de la configuration.
+fn ui_from_args(default: Ui) -> Ui {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let web = args.iter().any(|a| a == "--web");
-    let cli = args.iter().any(|a| a == "--cli") || !web;
-
-    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
-    let proxy = ProxyAgent::new(model, PREAMBLE).start();
-
-    if !web {
-        return cli_ui::run(proxy).await;
+    let has = |flag| args.iter().any(|a| a == flag);
+    match (has("--cli"), has("--web")) {
+        (true, true) => Ui::Both,
+        (true, false) => Ui::Cli,
+        (false, true) => Ui::Web,
+        (false, false) => default,
     }
-    let addr = std::env::var("WEB_ADDR").unwrap_or_else(|_| DEFAULT_WEB_ADDR.into());
-    let server = web_ui::server(proxy.clone(), &addr)?;
-    if !cli {
-        println!("API Web sur http://{addr} (POST /chat, DELETE /sessions/{{id}})");
-        return server.await;
+}
+
+/// Démarre les acteurs et lance la ou les interfaces.
+#[actix::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = AppConfig::load().unwrap_or_else(|e| {
+        eprintln!("Configuration : {e}");
+        std::process::exit(1)
+    });
+    let ui = ui_from_args(cfg.ui);
+    let addr = cfg.web_addr.clone();
+    let config = ConfigActor::new(cfg).start();
+    let proxy = ProxyAgent::new(config.clone()).start();
+
+    match ui {
+        Ui::Cli => cli_ui::run(proxy, config).await?,
+        Ui::Web => {
+            println!("API Web sur http://{addr} (POST /chat, DELETE /sessions/{{id}}, GET|PATCH /config)");
+            web_ui::server(proxy, config, &addr)?.await?
+        }
+        Ui::Both => {
+            // Le serveur tourne en fond ; quitter le TUI arrête le programme.
+            actix::spawn(web_ui::server(proxy.clone(), config.clone(), &addr)?);
+            cli_ui::run(proxy, config).await?
+        }
     }
-    // Mode mixte : le serveur tourne en fond, quitter le TUI arrête le programme.
-    actix::spawn(server);
-    cli_ui::run(proxy).await
+    Ok(())
 }
