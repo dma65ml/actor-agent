@@ -11,7 +11,7 @@ use crate::harness::probe::ToolMode;
 use crate::tools::Permission;
 
 /// Fichier de configuration lu (s'il existe) dans le répertoire courant.
-const CONFIG_FILE: &str = "config.toml";
+pub const CONFIG_FILE: &str = "config.toml";
 
 /// Erreurs de chargement de la configuration.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +42,8 @@ pub struct AppConfig {
     pub context_tokens: usize,
     /// Journal de session JSON Lines, rejoué au démarrage.
     pub session_file: String,
+    /// Historique des messages envoyés (JSON Lines), rappelé d'une séance à l'autre.
+    pub history_file: String,
     /// Répertoire de travail (créé s'il manque) : les outils ne peuvent pas en sortir.
     pub workspace: String,
     /// Mode d'appel d'outils : `auto` (détecté au démarrage), `native` ou `text`.
@@ -64,7 +66,8 @@ impl Default for AppConfig {
             max_turns: 50,
             context_tokens: 8192,
             session_file: ".actor-agent-session.jsonl".into(),
-            workspace: ".".into(),
+            history_file: ".actor-agent-history.jsonl".into(),
+            workspace: "workspace".into(),
             tool_mode: ToolMode::Auto,
             auto_approve: Permission::Read,
         }

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 actix = "0.13.5"
+arboard = { version = "3.7.0", default-features = false }
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 rig-agent = "0.44.0"
 rig-core = { version = "0.44.0", features = ["reqwest"] }

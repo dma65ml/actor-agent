@@ -3,3 +3,4 @@
 config.toml
 .actor-agent-session.jsonl
 /workspace
+.actor-agent-history.jsonl

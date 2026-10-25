@@ -2,6 +2,8 @@
 //! le modèle écrit des balises dans sa réponse, au contenu brut (rien à échapper),
 //! et le harness les exécute puis lui renvoie les résultats dans des balises `<result>`.
 
+use rig_agent::completion::Message;
+use rig_core::completion::message::{AssistantContent, Text, ToolResultContent, UserContent};
 use rig_core::tool::PortableTool;
 use serde_json::{Map, Value};
 
@@ -89,6 +91,64 @@ fn strip_newline(text: &str) -> &str {
     text.strip_prefix("\r\n").or_else(|| text.strip_prefix('\n')).unwrap_or(text)
 }
 
+/// Balise équivalente à un appel (inverse de `parse`).
+fn render(name: &str, args: &Value) -> String {
+    let field = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
+    let path = args.get("path").and_then(Value::as_str).map(|p| format!(" path=\"{p}\"")).unwrap_or_default();
+    match name {
+        WriteFile::NAME => format!("<{name}{path}>\n{}</{name}>", field("content")),
+        RunBash::NAME => format!("<{name}>{}</{name}>", field("command")),
+        EditFile::NAME => format!("<{name}{path}><old>{}</old><new>{}</new></{name}>", field("old_str"), field("new_str")),
+        _ => format!("<{name}{path}/>"),
+    }
+}
+
+/// Résultat d'un outil tel que renvoyé au modèle.
+pub fn result(name: &str, output: &str) -> String {
+    format!("<result tool=\"{name}\">\n{output}\n</result>\n")
+}
+
+/// `history` avec ses appels natifs (séances précédentes en mode natif) réécrits en balises :
+/// sinon rig les envoie sous la forme `[called tool …]`, que les petits modèles imitent au lieu
+/// d'utiliser les balises. Un message en donne un, la longueur est conservée.
+pub fn as_tags(history: &[Message]) -> Vec<Message> {
+    history
+        .iter()
+        .cloned()
+        .map(|message| match message {
+            Message::Assistant(mut turn) => {
+                for block in &mut turn.content {
+                    if let AssistantContent::ToolCall(call) = block {
+                        let tag = render(call.function.name.as_ref(), &call.function.arguments_value());
+                        *block = AssistantContent::Text(Text::new(tag));
+                    }
+                }
+                Message::Assistant(turn)
+            }
+            Message::User { content } => Message::User {
+                content: content
+                    .into_iter()
+                    .map(|part| match part {
+                        UserContent::ToolResult(r) => {
+                            let output: Vec<String> = r
+                                .content
+                                .iter()
+                                .map(|c| match c {
+                                    ToolResultContent::Text(t) => t.text.clone(),
+                                    other => serde_json::to_string(other).unwrap_or_default(),
+                                })
+                                .collect();
+                            UserContent::text(result(r.name.as_ref(), &output.join("\n")))
+                        }
+                        part => part,
+                    })
+                    .collect(),
+            },
+            message => message,
+        })
+        .collect()
+}
+
 /// Exécute un appel ; une erreur (arguments invalides, échec de l'outil) devient le résultat renvoyé au modèle.
 pub async fn run(ws: &Workspace, name: &str, args: Value) -> String {
     let res = match name {
@@ -138,6 +198,37 @@ let a = "y";</new></edit_file>
             ]
         );
         assert!(parse("Réponse finale, sans outil.").is_empty());
+    }
+
+    /// `render` est l'inverse de `parse`, guillemets et sauts de ligne compris.
+    #[test]
+    fn render_round_trips() {
+        let calls = [
+            ("write_file", json!({"path": "a.py", "content": "print(\"x\")\n"})),
+            ("run_bash", json!({"command": "ls -la"})),
+            ("edit_file", json!({"path": "a.py", "old_str": "x", "new_str": "\"y\""})),
+            ("read_file", json!({"path": "a.py"})),
+            ("list_dir", json!({})),
+        ];
+        let text: String = calls.iter().map(|(n, a)| render(n, a)).collect();
+        assert_eq!(parse(&text), calls);
+    }
+
+    /// Les appels et résultats natifs de l'historique deviennent des balises, un message pour un.
+    #[test]
+    fn native_history_becomes_tags() {
+        // Forme exacte du journal de session après un tour en mode natif.
+        let history: Vec<Message> = serde_json::from_value(json!([
+            {"role": "user", "content": [{"type": "text", "text": "liste"}]},
+            {"role": "assistant", "content": [{"type": "toolcall", "id": {"provider": "c1"},
+                "function": {"name": "run_bash", "arguments": {"command": "ls"}}}]},
+            {"role": "user", "content": [{"type": "toolresult", "call": {"provider": "c1"}, "name": "run_bash",
+                "content": [{"type": "text", "text": "a.txt"}]}]}
+        ]))
+        .unwrap();
+        let text = serde_json::to_string(&as_tags(&history)).unwrap();
+        assert!(text.contains("<run_bash>ls</run_bash>") && text.contains("<result tool=\\\"run_bash\\\">\\na.txt"), "{text}");
+        assert_eq!(as_tags(&history).len(), 3);
     }
 
     /// Exécution : succès, puis arguments invalides renvoyés comme erreur au modèle.

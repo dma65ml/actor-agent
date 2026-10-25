@@ -9,7 +9,7 @@ use crate::agent_actor::AgentError;
 use crate::tools::{Workspace, text};
 
 /// Boucle bornée à `max_turns` appels au modèle. Comme rig, elle laisse `history`
-/// inchangé en cas d'erreur.
+/// inchangé en cas d'erreur ; en cas de succès, ses appels natifs sont réécrits en balises.
 pub async fn chat(
     agent: &Agent,
     guard: &Guard,
@@ -18,7 +18,7 @@ pub async fn chat(
     prompt: String,
     history: &mut Vec<Message>,
 ) -> Result<String, AgentError> {
-    let mut work = history.clone();
+    let mut work = text::as_tags(history);
     let mut recent = Vec::new();
     let mut message = prompt;
     for _ in 0..max_turns {
@@ -37,7 +37,7 @@ pub async fn chat(
                 Err(Denial::Refused(reason)) => reason,
                 Err(Denial::Stop(reason)) => return Err(AgentError::Stopped(reason)),
             };
-            results.push_str(&format!("<result tool=\"{name}\">\n{output}\n</result>\n"));
+            results.push_str(&text::result(name, &output));
         }
         message = results;
     }

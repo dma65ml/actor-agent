@@ -10,7 +10,7 @@ use rig_agent::{Agent, AgentBuilder};
 use rig_core::providers::ollama::OllamaConfig;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, CONFIG_FILE};
 use crate::harness::guard::{Approval, Guard};
 use crate::harness::probe::{self, ToolMode};
 use crate::harness::session::{Event, SessionStore};
@@ -35,9 +35,6 @@ pub enum AgentError {
     /// L'agent n'a pas répondu dans le délai imparti.
     #[error("délai de réponse dépassé")]
     Timeout,
-    /// Le journal de session n'a pas pu être écrit.
-    #[error("journal de session : {0}")]
-    Session(#[from] std::io::Error),
     /// L'acteur s'est arrêté avant de répondre.
     #[error("acteur agent indisponible")]
     Mailbox(#[from] MailboxError),
@@ -95,7 +92,8 @@ impl AgentActor {
     /// Prépare le répertoire de travail, construit l'agent et rejoue le journal de session.
     /// Les demandes d'autorisation des garde-fous partent sur `approvals`.
     pub fn new(cfg: &AppConfig, approvals: UnboundedSender<Approval>) -> std::io::Result<Self> {
-        let workspace = Workspace::new(&cfg.workspace)?;
+        let protected = [CONFIG_FILE, cfg.session_file.as_str(), cfg.history_file.as_str()];
+        let workspace = Workspace::new(&cfg.workspace)?.protecting(protected);
         let mut actor = Self::build(cfg, approvals, workspace);
         actor.history = actor.session.replay()?;
         Ok(actor)
@@ -151,10 +149,12 @@ async fn compact_if_needed(summarizer: &Agent, history: &mut Vec<Message>, conte
 
 impl AgentActor {
     /// Résout le mode d'appel d'outils avant de traiter tout autre message
-    /// (`ctx.wait` suspend la boîte aux lettres pendant la détection).
+    /// (`ctx.wait` suspend la boîte aux lettres pendant la détection). Un modèle muet au-delà
+    /// du délai de réponse ne bloque pas l'agent : mode texte.
     fn detect_tool_mode(&mut self, ctx: &mut Context<Self>) {
         let detection = probe::resolve(self.tool_mode, self.ollama_url.clone(), self.model.clone());
-        ctx.wait(detection.into_actor(self).map(|mode, act, _| act.tool_mode = mode));
+        let detection = tokio::time::timeout(self.timeout, detection);
+        ctx.wait(detection.into_actor(self).map(|mode, act, _| act.tool_mode = mode.unwrap_or(ToolMode::Text)));
     }
 }
 
@@ -181,13 +181,16 @@ impl Handler<Ask> for AgentActor {
 
     /// Compacte le contexte si besoin, lance la boucle d'agent (outils compris) puis journalise
     /// les nouveaux messages. `AtomicResponse` sérialise les tours et garde l'historique cohérent.
+    /// Compaction et boucle sont chacune bornées par le délai de réponse.
     fn handle(&mut self, Ask(prompt): Ask, _ctx: &mut Self::Context) -> Self::Result {
         let (agent, text_agent, summarizer) = (self.agent.clone(), self.text_agent.clone(), self.summarizer.clone());
         let (guard, workspace, max_turns) = (self.guard.clone(), self.workspace.clone(), self.max_turns);
         let (timeout, context_tokens, native) = (self.timeout, self.context_tokens, self.tool_mode == ToolMode::Native);
         let mut history = std::mem::take(&mut self.history);
         let fut = async move {
-            let compaction = compact_if_needed(&summarizer, &mut history, context_tokens).await;
+            // Délai dépassé : historique intact (il n'est remplacé qu'une fois le résumé obtenu).
+            let compaction = tokio::time::timeout(timeout, compact_if_needed(&summarizer, &mut history, context_tokens));
+            let compaction = compaction.await.ok().flatten();
             let before = history.len();
             // En cas d'erreur, rig laisse `history` inchangé.
             let run = async {
@@ -206,9 +209,11 @@ impl Handler<Ask> for AgentActor {
                 let mut events = events.chain(history[before..].iter().map(|m| Event::Message { message: m.clone() }));
                 let logged = events.try_for_each(|e| act.session.append(e));
                 act.history = history;
-                let reply = res?;
-                logged?;
-                Ok(reply)
+                // Le tour a eu lieu (outils compris) : la réponse est rendue, avec un avertissement.
+                match logged {
+                    Err(e) => res.map(|reply| format!("{reply}\n\n⚠ journal de session non écrit : {e}")),
+                    Ok(()) => res,
+                }
             },
         )))
     }
@@ -347,6 +352,53 @@ mod tests {
         assert_eq!(agent.send(GetToolMode).await.unwrap(), ToolMode::Text);
         let reply = say(&agent, "OUTIL echo bonjour").await.unwrap();
         assert!(reply.contains("<result tool=\"run_bash\">"), "{reply}");
+    }
+
+    /// Mode texte : le même appel répété arrête l'exécution ; le plafond d'itérations aussi.
+    #[actix_web::test]
+    async fn text_mode_stops_stuck_loop_and_max_turns() {
+        let cfg = AppConfig { tool_mode: ToolMode::Text, ..test_config() };
+        let agent = AgentActor::new(&cfg, unbounded_channel().0).unwrap().start();
+        let err = say(&agent, "BOUCLE").await.unwrap_err();
+        assert!(matches!(&err, AgentError::Stopped(r) if r.contains("boucle détectée")), "{err}");
+        let capped = AgentActor::new(&AppConfig { max_turns: 2, ..cfg }, unbounded_channel().0).unwrap().start();
+        assert!(matches!(say(&capped, "BOUCLE").await, Err(AgentError::MaxTurns(2))));
+    }
+
+    /// Un modèle muet ne bloque ni la détection du mode (repli sur le texte) ni la compaction :
+    /// chacune est bornée par le délai de réponse (1 s en test, le faux modèle répond en 10 s).
+    #[actix_web::test]
+    async fn silent_model_never_blocks() {
+        let cfg = AppConfig { model: "lent".into(), tool_mode: ToolMode::Auto, context_tokens: 1, ..test_config() };
+        for i in 0..4 {
+            let message = Event::Message { message: Message::user(format!("ancien {i}")) };
+            SessionStore::new(&cfg.session_file).append(message).unwrap();
+        }
+        let start = std::time::Instant::now();
+        let agent = AgentActor::new(&cfg, unbounded_channel().0).unwrap().start();
+        assert_eq!(agent.send(GetToolMode).await.unwrap(), ToolMode::Text);
+        assert!(matches!(say(&agent, "un").await, Err(AgentError::Timeout)));
+        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+    }
+
+    /// Journal impossible à écrire : la réponse est quand même rendue, avec un avertissement.
+    #[actix_web::test]
+    async fn reply_survives_session_write_failure() {
+        let (agent, cfg) = start_agent();
+        std::fs::create_dir(&cfg.session_file).unwrap();
+        let reply = say(&agent, "un").await.unwrap();
+        assert!(reply.starts_with("2 messages : un") && reply.contains("journal de session non écrit"), "{reply}");
+    }
+
+    /// Les fichiers du harness situés dans le répertoire de travail sont interdits aux outils.
+    #[actix_web::test]
+    async fn harness_files_are_protected() {
+        let cfg = test_config();
+        let cfg = AppConfig { session_file: format!("{}/journal.jsonl", cfg.workspace), ..cfg };
+        let actor = AgentActor::new(&cfg, unbounded_channel().0).unwrap();
+        let args = serde_json::json!({"path": "journal.jsonl", "content": "faux"});
+        let out = text::run(&actor.workspace, "write_file", args).await;
+        assert!(out.contains("fichier protégé"), "{out}");
     }
 
     /// Le même appel répété arrête l'exécution ; le plafond d'itérations aussi.

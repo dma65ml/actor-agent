@@ -63,7 +63,80 @@ async fn editing_input() {
     let (mut app, _) = app();
     type_text(&mut app, "abc");
     app.on_key(press(KeyCode::Backspace));
-    assert_eq!(app.input, "ab");
+    assert_eq!(app.input.text(), "ab");
+}
+
+/// Flèches horizontales, début / fin de ligne et suppression éditent au curseur.
+#[actix_web::test]
+async fn horizontal_editing_keys() {
+    let (mut app, _) = app();
+    type_text(&mut app, "ac");
+    app.on_key(press(KeyCode::Left));
+    type_text(&mut app, "b");
+    app.on_key(press(KeyCode::Home));
+    app.on_key(press(KeyCode::Delete));
+    app.on_key(press(KeyCode::End));
+    type_text(&mut app, "d");
+    assert_eq!(app.input.text(), "bcd");
+    app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    app.on_key(press(KeyCode::Right));
+    app.on_key(press(KeyCode::Backspace));
+    app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    type_text(&mut app, "!");
+    assert_eq!(app.input.text(), "cd!");
+}
+
+/// Alt+Entrée, Maj+Entrée et Ctrl+J insèrent un saut de ligne ; un collage multiligne n'est pas envoyé ;
+/// ↑ / ↓ parcourent les lignes avant l'historique ; le message multiligne part en entier.
+#[actix_web::test]
+async fn multiline_input_and_paste() {
+    let (mut app, mut rx) = app();
+    type_text(&mut app, "a");
+    for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+        app.on_key(KeyEvent::new(KeyCode::Enter, modifiers));
+    }
+    app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+    app.on_paste("b\r\nc");
+    assert_eq!(app.input.text(), "a\n\n\nb\nc");
+    assert!(app.history.is_empty(), "rien n'est envoyé");
+    for _ in 0..4 {
+        app.on_key(press(KeyCode::Up));
+    }
+    type_text(&mut app, ">");
+    assert_eq!(app.input.text(), ">a\n\n\nb\nc");
+    app.on_key(press(KeyCode::Enter));
+    assert!(matches!(rx.recv().await.unwrap(), Reply::Answer(Ok(a)) if a.ends_with(">a\n\n\nb\nc")));
+}
+
+/// Les messages envoyés sont rappelés dans une nouvelle séance.
+#[actix_web::test]
+async fn sent_messages_survive_restart() {
+    let (agent, config) = start_agent();
+    let (tx, _rx) = unbounded_channel();
+    let mut first = App::new(agent.clone(), config.clone(), tx.clone());
+    type_text(&mut first, "/model a");
+    first.submit();
+    let mut second = App::new(agent, config, tx);
+    second.on_key(press(KeyCode::Up));
+    assert_eq!(second.input.text(), "/model a");
+}
+
+/// `/copy` sans réponse de l'agent le signale sans toucher au presse-papiers.
+#[actix_web::test]
+async fn copy_without_reply() {
+    let (mut app, _) = app();
+    type_text(&mut app, "/copy");
+    app.submit();
+    assert!(matches!(app.history.as_slice(), [(Role::System, m)] if m == "Aucune réponse à copier."));
+}
+
+/// La zone de saisie s'agrandit avec les lignes et défile pour garder le curseur visible.
+#[actix_web::test]
+async fn draw_grows_multiline_input() {
+    let (mut app, _) = app();
+    app.input.set(&(1..=12).map(|i| format!("ligne{i:02}")).collect::<Vec<_>>().join("\n"));
+    let screen = render(&mut app, 60, 30);
+    assert!(screen.contains("ligne12") && screen.contains("ligne05") && !screen.contains("ligne04"));
 }
 
 /// Les touches de défilement modifient le décalage sans passer sous zéro.
@@ -97,34 +170,35 @@ async fn arrows_recall_sent_messages() {
     let (mut app, _) = app();
     app.on_key(press(KeyCode::Up));
     app.on_key(press(KeyCode::Down));
-    assert!(app.input.is_empty(), "rien à rappeler");
+    assert!(app.input.text().is_empty(), "rien à rappeler");
     for msg in ["/model a", "/model b"] {
         type_text(&mut app, msg);
         app.submit();
     }
     app.on_key(press(KeyCode::Up));
-    assert_eq!(app.input, "/model b");
+    assert_eq!(app.input.text(), "/model b");
     app.on_key(press(KeyCode::Up));
     app.on_key(press(KeyCode::Up));
-    assert_eq!(app.input, "/model a");
+    assert_eq!(app.input.text(), "/model a");
     app.on_key(press(KeyCode::Down));
-    assert_eq!(app.input, "/model b");
+    assert_eq!(app.input.text(), "/model b");
     app.on_key(press(KeyCode::Down));
-    assert!(app.input.is_empty() && app.recall.is_none());
+    assert!(app.input.text().is_empty());
 }
 
 /// Entrée envoie le message, passe en génération puis affiche la réponse de l'agent.
+/// Lignes vides et espaces de fin sont retirés, l'indentation de la première ligne est gardée.
 #[actix_web::test]
 async fn submit_sends_and_receives_reply() {
     let (mut app, mut rx) = app();
-    type_text(&mut app, "  salut ");
+    app.on_paste("\n  salut \n");
     app.on_key(press(KeyCode::Enter));
-    assert!(app.busy && app.input.is_empty());
+    assert!(app.busy && app.input.text().is_empty());
     let reply = rx.recv().await.unwrap();
     app.on_reply(reply);
     assert!(!app.busy);
     assert!(
-        matches!(app.history.as_slice(), [(Role::User, u), (Role::Agent, a)] if u == "salut" && a == "2 messages : salut")
+        matches!(app.history.as_slice(), [(Role::User, u), (Role::Agent, a)] if u == "  salut" && a == "2 messages :   salut")
     );
 }
 
@@ -195,7 +269,7 @@ async fn draw_shows_history_input_and_status() {
         (Role::Error, "panne".into()),
         (Role::System, "info".into()),
     ];
-    app.input = "brouillon".into();
+    app.input.set("brouillon");
     let screen = render(&mut app, 60, 20);
     for text in [
         "Vous",
@@ -282,7 +356,7 @@ async fn approval_is_answered_by_key() {
         assert!(render(&mut app, 80, 20).contains("Autoriser cet appel"));
         type_text(&mut app, &key.to_string());
         assert_eq!(answer.await.unwrap(), expected);
-        assert!(app.pending.is_none() && app.input.is_empty());
+        assert!(app.pending.is_none() && app.input.text().is_empty());
     }
     let notes: Vec<_> = app.history.iter().map(|(_, t)| t.as_str()).collect();
     assert_eq!(notes[1..], ["Autorisé : run_bash rm x", "Autorisation demandée : run_bash rm x", "Refusé : run_bash rm x"]);

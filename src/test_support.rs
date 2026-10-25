@@ -8,7 +8,8 @@
 //!   ne déclare pas d'outils), puis répond `outil : <résultat>` ;
 //! - essai de détection du mode (outil `save_text`) → renvoie le texte intact, sauf pour le
 //!   modèle `tronque` qui le coupe au premier guillemet, comme llama3.2 ;
-//! - message `BOUCLE` → redemande sans fin le même appel d'outil ;
+//! - conversation commencée par `BOUCLE` → redemande sans fin le même appel d'outil (natif ou balise) ;
+//! - modèle `lent` → répond après 10 s, quel que soit le message ;
 //! - sinon → `"<n> messages : <dernier message>"`, `n` révélant la taille de l'historique.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,16 +51,21 @@ async fn chat_completions(body: web::Json<Value>) -> HttpResponse {
     let messages = body["messages"].as_array().cloned().unwrap_or_default();
     let last = messages.last().map(|m| text_of(&m["content"])).unwrap_or_default();
     let last_role = messages.last().map(|m| m["role"].clone()).unwrap_or_default();
-    let last_user = messages.iter().rev().find(|m| m["role"] == "user").map(|m| text_of(&m["content"]));
+    let has_tools = body["tools"].as_array().is_some_and(|t| !t.is_empty());
+    let looping = messages.iter().any(|m| m["role"] == "user" && text_of(&m["content"]) == "BOUCLE");
     if last.contains("ERREUR") {
         return HttpResponse::InternalServerError().body("panne simulée");
     }
     if last.contains("LENT") {
         actix_web::rt::time::sleep(Duration::from_secs(3)).await;
     }
-    let has_tools = body["tools"].as_array().is_some_and(|t| !t.is_empty());
-    let message = if last_user.as_deref() == Some("BOUCLE") {
+    if body["model"] == "lent" {
+        actix_web::rt::time::sleep(Duration::from_secs(10)).await;
+    }
+    let message = if looping && has_tools {
         bash_call(messages.len(), "echo boucle")
+    } else if looping {
+        json!({ "role": "assistant", "content": "<run_bash>echo boucle</run_bash>" })
     } else if last_role == "tool" || last.starts_with("<result") {
         json!({ "role": "assistant", "content": format!("outil : {last}") })
     } else if let Some((_, sample)) = last.split_once("sans rien changer :\n") {
@@ -101,8 +107,8 @@ pub fn fake_ollama() -> String {
     url
 }
 
-/// Configuration de test : faux serveur Ollama, délai d'une seconde, journal de session propre
-/// au test et appel d'outils natif (sans détection).
+/// Configuration de test : faux serveur Ollama, délai d'une seconde, journal de session et
+/// répertoire de travail propres au test, appel d'outils natif (sans détection).
 pub fn test_config() -> AppConfig {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -112,6 +118,8 @@ pub fn test_config() -> AppConfig {
         ollama_url: fake_ollama(),
         answer_timeout_secs: 1,
         session_file: session.to_string_lossy().into_owned(),
+        history_file: format!("{}.historique", session.to_string_lossy()),
+        workspace: format!("{}.ws", session.to_string_lossy()),
         tool_mode: ToolMode::Native,
         ..AppConfig::default()
     }

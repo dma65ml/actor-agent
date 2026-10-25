@@ -36,7 +36,8 @@ Chaque source remplace la précédente, dans cet ordre :
 | `max_turns`           | —                        | `50` appels au modèle par message                 |
 | `context_tokens`      | —                        | `8192` (compaction à 80 %)                        |
 | `session_file`        | —                        | `.actor-agent-session.jsonl`                      |
-| `workspace`           | —                        | `.` (répertoire de travail, créé s'il manque)     |
+| `history_file`        | —                        | `.actor-agent-history.jsonl` (messages envoyés, rappelés d'une séance à l'autre) |
+| `workspace`           | —                        | `workspace` (répertoire de travail, créé s'il manque) |
 | `tool_mode` (`auto`, `native`, `text`) | — | `auto` (détecté au démarrage et à chaque `/clear`) |
 | `auto_approve` (`read`, `workspace`, `full`) | — | `read`                                          |
 
@@ -57,12 +58,18 @@ Le modèle et le préambule se changent pendant l'exécution, avec `/model` et `
 | Touche / commande     | Action                                              |
 |-----------------------|-----------------------------------------------------|
 | `Entrée`              | envoyer le message                                  |
+| `Alt+Entrée` / `Maj+Entrée` / `Ctrl+J` | nouvelle ligne (Maj+Entrée seulement si le terminal la distingue) |
+| `←` `→` `Début` `Fin` (`Ctrl+A` `Ctrl+E`) `Suppr` `⌫` | édition au curseur |
+| `↑` `↓`               | ligne précédente / suivante ; depuis la première / dernière ligne, rappel des messages envoyés, y compris des séances précédentes |
+| coller (`Cmd+V`…)     | insère le texte tel quel, sauts de ligne compris, sans l'envoyer |
 | molette / `PgUp` `PgDn` | faire défiler l'historique                        |
-| `↑` `↓`               | rappeler les messages envoyés                       |
 | `Échap` / `Ctrl+C`    | quitter                                             |
+| `/copy`               | copier la dernière réponse de l'agent dans le presse-papiers |
 | `/clear`              | effacer la conversation (et appliquer la config à jour) |
 | `/model <nom>`        | changer le modèle (actif après `/clear`)            |
 | `/preamble <texte>`   | changer le préambule (actif après `/clear`)         |
+
+La zone de saisie s'agrandit jusqu'à 8 lignes puis défile. La souris étant capturée pour la molette, la sélection native du terminal demande souvent une touche maintenue (Option dans iTerm2) ; `/copy` est l'alternative.
 
 La barre du bas indique l'état de l'agent : « En attente... », « Génération en cours... » ou une demande d'autorisation (`o` pour autoriser, toute autre touche pour refuser, quitter refuse). Demandes et réponses sont notées dans l'historique. Pendant une génération, l'interface reste réactive mais un nouvel envoi est ignoré ; une saisie vide aussi.
 
@@ -73,7 +80,7 @@ La barre du bas indique l'état de l'agent : « En attente... », « Génératio
 | Boucle bornée | boucle d'outils de rig, plafonnée à `max_turns` ; le même appel répété 3 fois d'affilée arrête l'exécution |
 | Outils | `list_dir`, `read_file`, `edit_file`, `write_file`, `run_bash`, confinés au répertoire de travail (`workspace`) ; appel natif ou par balises texte selon le modèle (voir plus bas) |
 | Permissions | chaque appel a un niveau (`read` < `workspace` < `full`) ; au-delà de `auto_approve`, il attend votre accord. `rm`, `sudo`..., toute commande composée (`;`, `\|`, `$`, redirections) ou visant l'extérieur (`/…`, `~`, `..`) relève de `full` |
-| Prompt système | `preamble`, puis les fichiers `AGENTS.md` / `CLAUDE.md` trouvés de la racine jusqu'au répertoire de travail (le plus proche l'emporte) |
+| Prompt système | `preamble`, puis les fichiers `AGENTS.md` / `CLAUDE.md` trouvés de la racine jusqu'au répertoire de travail (le plus proche l'emporte) ; tout fichier d'instructions d'un dossier parent, jusqu'à la racine du disque, entre donc dans le prompt |
 | Session | journal JSON Lines en ajout seul (`session_file`), rejoué au démarrage : la conversation reprend où elle s'était arrêtée. `/clear` y inscrit une remise à zéro |
 | Compaction | au-delà de 80 % de `context_tokens` (estimation : 4 caractères par jeton), les anciens messages sont résumés et les 6 derniers gardés tels quels |
 
@@ -91,7 +98,13 @@ La boucle d'agent est celle de rig (`agent.chat` avec `default_max_turns`) : le 
 
 Les chemins des outils de fichiers sont relatifs au répertoire de travail. Un chemin qui en sort (absolu, `..`, lien symbolique vers l'extérieur) est refusé, quelle que soit la permission : le modèle reçoit l'erreur. Des arguments illisibles ou un outil inconnu demandent le niveau `full`. Une sortie de plus de 20 000 caractères est tronquée. Un appel refusé n'est pas exécuté : le modèle reçoit « refusé par l'utilisateur » et peut continuer.
 
-Par défaut (`auto_approve = "read"`), seules les lectures s'exécutent sans demander. `auto_approve = "workspace"` reproduit le choix de l'article : toute commande non destructive s'exécute alors directement. Il n'y a pas de bac à sable pour `run_bash` : son classement est lexical, et une commande autorisée tourne avec vos droits.
+Par défaut (`auto_approve = "read"`), seules les lectures s'exécutent sans demander. `auto_approve = "workspace"` reproduit le choix de l'article : toute commande non destructive s'exécute alors directement.
+
+Limites de sécurité, faute de bac à sable pour `run_bash` (son classement est lexical, et une commande autorisée tourne avec vos droits) :
+
+- **`workspace` équivaut à une confiance totale** : toute commande inconnue (`python3`, `curl`, `cargo build`…) relève de ce niveau ; l'agent peut écrire un script avec `write_file` puis l'exécuter sans rien demander, et ce script peut tout faire (lire `~/.ssh`, accéder au réseau).
+- **Liens symboliques et `run_bash`** : les outils de fichiers suivent les liens et refusent ceux qui sortent du répertoire de travail, mais pas `run_bash` : `cat lien/etc/passwd` passe au niveau `read` si `lien` pointe vers `/` (créer le lien demande, lui, le niveau `workspace`).
+- **Fichiers du harness** : `config.toml`, le journal de session et l'historique des messages sont interdits aux outils de fichiers s'ils se trouvent dans le répertoire de travail (sinon l'agent pourrait élargir ses permissions ou falsifier sa session) ; `run_bash` reste soumis aux seules permissions.
 
 ### Compatibilité multi-modèles
 
@@ -122,8 +135,8 @@ Avec `tool_mode = "auto"`, l'agent fait au démarrage (et après chaque `/clear`
 | `échec de l'agent (Ollama est-il démarré ?) : …` | appel au modèle en échec (serveur arrêté, modèle introuvable…) |
 | `limite de N appels au modèle atteinte ; …` | plafond `max_turns` atteint |
 | `exécution arrêtée : boucle détectée …` | même appel d'outil répété 3 fois |
-| `délai de réponse dépassé` | pas de réponse dans `answer_timeout_secs` ; la génération et la commande en cours sont abandonnées |
-| `journal de session : …` | écriture du journal impossible |
+| `délai de réponse dépassé` | pas de réponse dans `answer_timeout_secs` ; la génération et la commande en cours sont abandonnées. La détection du mode d'outils et le résumé de compaction ont chacun le même délai : dépassé, le mode texte est retenu, la compaction est remise au tour suivant |
+| `⚠ journal de session non écrit : …` (après la réponse) | le tour a eu lieu mais n'a pas pu être journalisé ; il ne sera pas rejoué au redémarrage |
 | `acteur agent indisponible` | acteur arrêté avant de répondre |
 
 ## Architecture
@@ -143,7 +156,7 @@ Le cœur est une bibliothèque (`src/lib.rs`) ; le binaire ne fait que l'assembl
 | `agent_actor.rs` | `AgentActor` : assemble le harness, historique, délai ; messages `Ask` et `Reset` |
 | `harness/`       | `prompt.rs` (prompt système), `session.rs` (journal), `guard.rs` (garde-fous), `compact.rs` (compaction), `probe.rs` (détection du mode d'outils), `text_loop.rs` (boucle du mode texte) |
 | `tools/`         | un fichier par outil, `workspace.rs` (confinement des chemins), `text.rs` (format à balises), `mod.rs` (permissions) |
-| `cli_ui/`        | TUI ratatui, jamais bloqué pendant la génération : `mod.rs` (boucle d'événements), `app.rs` (état, saisie), `draw.rs` (rendu), `tests.rs` |
+| `cli_ui/`        | TUI ratatui, jamais bloqué pendant la génération : `mod.rs` (boucle d'événements), `app.rs` (état, touches), `input.rs` (édition multiligne), `history.rs` (messages envoyés persistants), `draw.rs` (rendu), `tests.rs` |
 | `lib.rs`         | expose les modules ci-dessus                                         |
 | `main.rs`        | chargement de la config, démarrage de l'agent et du TUI              |
 
