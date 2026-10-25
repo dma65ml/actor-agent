@@ -4,7 +4,10 @@
 //! - message contenant `ERREUR` → réponse 500 (serveur en échec) ;
 //! - message contenant `LENT` → répond après 3 s (pour provoquer un dépassement de délai) ;
 //! - message `MODELE` / `PREAMBULE` → renvoie le modèle / la consigne système reçus ;
-//! - message `OUTIL <commande>` → demande l'outil `run_bash`, puis répond `outil : <résultat>` ;
+//! - message `OUTIL <commande>` → demande l'outil `run_bash` (appel natif, ou balise si la requête
+//!   ne déclare pas d'outils), puis répond `outil : <résultat>` ;
+//! - essai de détection du mode (outil `save_text`) → renvoie le texte intact, sauf pour le
+//!   modèle `tronque` qui le coupe au premier guillemet, comme llama3.2 ;
 //! - message `BOUCLE` → redemande sans fin le même appel d'outil ;
 //! - sinon → `"<n> messages : <dernier message>"`, `n` révélant la taille de l'historique.
 
@@ -19,6 +22,7 @@ use crate::agent_actor::AgentActor;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::config::AppConfig;
+use crate::harness::probe::ToolMode;
 
 /// Extrait le texte d'un message OpenAI (chaîne simple ou liste de parties `text`).
 fn text_of(content: &Value) -> String {
@@ -28,13 +32,17 @@ fn text_of(content: &Value) -> String {
     }
 }
 
-/// Message d'assistant demandant `run_bash` avec `command`.
-fn bash_call(id: usize, command: &str) -> Value {
-    let arguments = json!({ "command": command }).to_string();
+/// Message d'assistant demandant l'outil `name` avec `args`.
+fn tool_call(id: usize, name: &str, args: Value) -> Value {
     json!({ "role": "assistant", "content": null, "tool_calls": [{
         "id": format!("appel-{id}"), "type": "function",
-        "function": { "name": "run_bash", "arguments": arguments }
+        "function": { "name": name, "arguments": args.to_string() }
     }]})
+}
+
+/// Message d'assistant demandant `run_bash` avec `command`.
+fn bash_call(id: usize, command: &str) -> Value {
+    tool_call(id, "run_bash", json!({ "command": command }))
 }
 
 /// Répond comme Ollama selon les messages reçus (voir l'en-tête du module).
@@ -49,12 +57,20 @@ async fn chat_completions(body: web::Json<Value>) -> HttpResponse {
     if last.contains("LENT") {
         actix_web::rt::time::sleep(Duration::from_secs(3)).await;
     }
+    let has_tools = body["tools"].as_array().is_some_and(|t| !t.is_empty());
     let message = if last_user.as_deref() == Some("BOUCLE") {
         bash_call(messages.len(), "echo boucle")
-    } else if last_role == "tool" {
+    } else if last_role == "tool" || last.starts_with("<result") {
         json!({ "role": "assistant", "content": format!("outil : {last}") })
+    } else if let Some((_, sample)) = last.split_once("sans rien changer :\n") {
+        let sample = if body["model"] == "tronque" { sample.split('"').next().unwrap() } else { sample };
+        tool_call(messages.len(), "save_text", json!({ "text": sample }))
     } else if let Some(command) = last.strip_prefix("OUTIL ") {
-        bash_call(messages.len(), command)
+        if has_tools {
+            bash_call(messages.len(), command)
+        } else {
+            json!({ "role": "assistant", "content": format!("<run_bash>{command}</run_bash>") })
+        }
     } else {
         let reply = match last.as_str() {
             "MODELE" => body["model"].as_str().unwrap_or_default().to_owned(),
@@ -85,7 +101,8 @@ pub fn fake_ollama() -> String {
     url
 }
 
-/// Configuration de test : faux serveur Ollama, délai d'une seconde et journal de session propre au test.
+/// Configuration de test : faux serveur Ollama, délai d'une seconde, journal de session propre
+/// au test et appel d'outils natif (sans détection).
 pub fn test_config() -> AppConfig {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -95,6 +112,7 @@ pub fn test_config() -> AppConfig {
         ollama_url: fake_ollama(),
         answer_timeout_secs: 1,
         session_file: session.to_string_lossy().into_owned(),
+        tool_mode: ToolMode::Native,
         ..AppConfig::default()
     }
 }

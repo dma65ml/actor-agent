@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use tokio::sync::oneshot;
 
-use super::app::{App, Role};
+use super::app::{App, Reply, Role};
 use super::event_loop;
 use crate::agent_actor::AgentError;
 use crate::harness::guard::Approval;
@@ -23,7 +23,7 @@ fn press(code: KeyCode) -> KeyEvent {
 }
 
 /// Interface de test branchée sur le faux Ollama, avec le récepteur des réponses.
-fn app() -> (App, UnboundedReceiver<Result<String, AgentError>>) {
+fn app() -> (App, UnboundedReceiver<Reply>) {
     let (agent, config) = start_agent();
     let (tx, rx) = unbounded_channel();
     (App::new(agent, config, tx), rx)
@@ -145,11 +145,11 @@ async fn submit_is_ignored_when_empty_or_busy() {
 #[actix_web::test]
 async fn error_reply_is_shown() {
     let (mut app, _) = app();
-    app.on_reply(Err(AgentError::Timeout));
+    app.on_reply(Reply::Answer(Err(AgentError::Timeout)));
     assert!(matches!(app.history.as_slice(), [(Role::Error, e)] if e.contains("délai")));
 }
 
-/// `/clear` vide l'historique local et celui de l'agent.
+/// `/clear` vide l'historique local et celui de l'agent, puis annonce le mode d'outils redétecté.
 #[actix_web::test]
 async fn clear_command_resets_history() {
     let (mut app, mut rx) = app();
@@ -159,9 +159,11 @@ async fn clear_command_resets_history() {
     type_text(&mut app, "/clear");
     app.submit();
     assert!(app.history.is_empty());
+    app.on_reply(rx.recv().await.unwrap());
+    assert!(matches!(app.history.as_slice(), [(Role::System, m)] if m == "Outils : appel natif"));
     type_text(&mut app, "un");
     app.submit();
-    assert_eq!(rx.recv().await.unwrap().unwrap(), "2 messages : un");
+    assert!(matches!(rx.recv().await.unwrap(), Reply::Answer(Ok(a)) if a == "2 messages : un"));
 }
 
 /// `/model` et `/preamble` mettent à jour la configuration et l'annoncent.

@@ -16,7 +16,7 @@ async fn main() -> std::io::Result<()> {
     // Canal des demandes d'autorisation : des garde-fous de l'agent vers le TUI.
     let (approvals, approval_rx) = unbounded_channel();
     let agent = AgentActor::new(&cfg, approvals).unwrap_or_else(|e| {
-        eprintln!("Session ({}) : {e}", cfg.session_file);
+        eprintln!("Démarrage (répertoire de travail {}, session {}) : {e}", cfg.workspace, cfg.session_file);
         std::process::exit(1)
     });
     cli_ui::run(agent.start(), cfg, approval_rx).await

@@ -7,7 +7,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::harness::tools::Permission;
+use crate::harness::probe::ToolMode;
+use crate::tools::Permission;
 
 /// Fichier de configuration lu (s'il existe) dans le répertoire courant.
 const CONFIG_FILE: &str = "config.toml";
@@ -41,6 +42,10 @@ pub struct AppConfig {
     pub context_tokens: usize,
     /// Journal de session JSON Lines, rejoué au démarrage.
     pub session_file: String,
+    /// Répertoire de travail (créé s'il manque) : les outils ne peuvent pas en sortir.
+    pub workspace: String,
+    /// Mode d'appel d'outils : `auto` (détecté au démarrage), `native` ou `text`.
+    pub tool_mode: ToolMode,
     /// Niveau de permission accordé sans confirmation (`read`, `workspace` ou `full`).
     pub auto_approve: Permission,
 }
@@ -51,13 +56,16 @@ impl Default for AppConfig {
         Self {
             ollama_url: "http://localhost:11434".into(),
             model: "llama3.2".into(),
-            preamble: "Tu es un agent de développement. Tu disposes des outils read_file, write_file \
-                       et run_bash. Réponds en français, de façon concise."
+            preamble: "Tu es un agent de développement. Tu disposes des outils list_dir, read_file, \
+                       edit_file, write_file et run_bash, confinés au répertoire de travail. \
+                       Réponds en français, de façon concise."
                 .into(),
             answer_timeout_secs: 600,
             max_turns: 50,
             context_tokens: 8192,
             session_file: ".actor-agent-session.jsonl".into(),
+            workspace: ".".into(),
+            tool_mode: ToolMode::Auto,
             auto_approve: Permission::Read,
         }
     }
@@ -132,9 +140,10 @@ mod tests {
     #[test]
     fn existing_file_is_read() {
         let path = temp_dir("existing").join(CONFIG_FILE);
-        std::fs::write(&path, "model = \"qwen\"\nauto_approve = \"workspace\"").unwrap();
+        std::fs::write(&path, "model = \"qwen\"\nauto_approve = \"workspace\"\nworkspace = \"ws\"\ntool_mode = \"text\"").unwrap();
         let cfg = AppConfig::load_from(&path, env(&[])).unwrap();
         assert_eq!((cfg.model.as_str(), cfg.auto_approve), ("qwen", Permission::Workspace));
+        assert_eq!((cfg.workspace.as_str(), cfg.tool_mode), ("ws", ToolMode::Text));
         assert_eq!(cfg.answer_timeout_secs, AppConfig::default().answer_timeout_secs);
     }
 

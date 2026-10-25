@@ -4,9 +4,10 @@ use actix::Addr;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::agent_actor::{AgentActor, AgentError, Ask, Reset};
+use crate::agent_actor::{AgentActor, AgentError, Ask, GetToolMode, Reset};
 use crate::config::AppConfig;
 use crate::harness::guard::Approval;
+use crate::harness::probe::ToolMode;
 
 /// Auteur d'une entrée de l'historique.
 pub(super) enum Role {
@@ -16,12 +17,20 @@ pub(super) enum Role {
     System,
 }
 
+/// Retour asynchrone de l'agent vers l'interface.
+pub(super) enum Reply {
+    /// Réponse (ou erreur) à un message envoyé.
+    Answer(Result<String, AgentError>),
+    /// Mode d'appel d'outils retenu.
+    Mode(ToolMode),
+}
+
 /// État de l'interface.
 pub(super) struct App {
     pub(super) agent: Addr<AgentActor>,
     /// Configuration à appliquer au prochain `/clear` (modifiée par `/model`, `/preamble`).
     pub(super) config: AppConfig,
-    pub(super) replies: UnboundedSender<Result<String, AgentError>>,
+    pub(super) replies: UnboundedSender<Reply>,
     pub(super) history: Vec<(Role, String)>,
     pub(super) input: String,
     pub(super) busy: bool,
@@ -43,7 +52,7 @@ impl App {
     pub(super) fn new(
         agent: Addr<AgentActor>,
         config: AppConfig,
-        replies: UnboundedSender<Result<String, AgentError>>,
+        replies: UnboundedSender<Reply>,
     ) -> Self {
         Self {
             agent,
@@ -131,6 +140,7 @@ impl App {
         if content == "/clear" {
             self.agent.do_send(Reset(self.config.clone()));
             self.history.clear();
+            self.show_tool_mode();
             return;
         }
         let field = match content.split_once(' ') {
@@ -150,17 +160,33 @@ impl App {
         actix::spawn(async move {
             // Le récepteur n'existe plus si l'utilisateur a quitté : rien à faire.
             let reply = agent.send(Ask(content)).await.map_err(Into::into).and_then(|r| r);
-            let _ = replies.send(reply);
+            let _ = replies.send(Reply::Answer(reply));
         });
     }
 
-    /// Ajoute la réponse (ou l'erreur) de l'agent à l'historique.
-    pub(super) fn on_reply(&mut self, reply: Result<String, AgentError>) {
-        self.busy = false;
-        self.scroll_up = 0;
-        self.history.push(match reply {
-            Ok(text) => (Role::Agent, text),
-            Err(e) => (Role::Error, e.to_string()),
+    /// Demande à l'agent son mode d'appel d'outils (servi après la détection) pour l'afficher.
+    pub(super) fn show_tool_mode(&self) {
+        let (agent, replies) = (self.agent.clone(), self.replies.clone());
+        actix::spawn(async move {
+            if let Ok(mode) = agent.send(GetToolMode).await {
+                let _ = replies.send(Reply::Mode(mode));
+            }
         });
+    }
+
+    /// Ajoute la réponse (ou l'erreur) de l'agent, ou le mode d'outils, à l'historique.
+    pub(super) fn on_reply(&mut self, reply: Reply) {
+        self.scroll_up = 0;
+        let entry = match reply {
+            Reply::Mode(mode) => (Role::System, format!("Outils : {mode}")),
+            Reply::Answer(answer) => {
+                self.busy = false;
+                match answer {
+                    Ok(text) => (Role::Agent, text),
+                    Err(e) => (Role::Error, e.to_string()),
+                }
+            }
+        };
+        self.history.push(entry);
     }
 }

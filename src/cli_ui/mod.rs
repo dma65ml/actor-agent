@@ -45,6 +45,7 @@ async fn event_loop<B: Backend>(
 ) -> Result<(), B::Error> {
     let (replies, mut reply_rx) = unbounded_channel();
     let mut app = App::new(agent, config, replies);
+    app.show_tool_mode();
     loop {
         terminal.draw(|f| app.draw(f))?;
         // Ordre fixe (`biased`) : une demande d'autorisation arrivée est affichée avant de

@@ -2,3 +2,4 @@
 .DS_Store
 config.toml
 .actor-agent-session.jsonl
+/workspace

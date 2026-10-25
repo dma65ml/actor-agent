@@ -1,8 +1,9 @@
 //! Briques du harness d'agent (d'après « Build a minimal agent harness ») :
-//! la boucle elle-même est celle de rig (`max_turns`), ces modules l'encadrent.
+//! en mode natif, la boucle est celle de rig (`max_turns`) ; en mode texte, `text_loop`.
 
 pub mod compact;
 pub mod guard;
+pub mod probe;
 pub mod prompt;
 pub mod session;
-pub mod tools;
+pub mod text_loop;

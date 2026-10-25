@@ -1,5 +1,6 @@
 //! Acteur actix encapsulant le harness d'agent : agent rig outillé, garde-fous,
 //! journal de session et compaction du contexte. L'historique vit dans l'état de l'acteur.
+//! Le mode d'appel d'outils (natif ou texte) est choisi au démarrage et à chaque `Reset`.
 
 use std::time::Duration;
 
@@ -11,9 +12,10 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::AppConfig;
 use crate::harness::guard::{Approval, Guard};
+use crate::harness::probe::{self, ToolMode};
 use crate::harness::session::{Event, SessionStore};
-use crate::harness::tools::{ReadFile, RunBash, WriteFile};
-use crate::harness::{compact, prompt};
+use crate::harness::{compact, prompt, text_loop};
+use crate::tools::{EditFile, ListDir, ReadFile, RunBash, Workspace, WriteFile, text};
 
 /// Consigne de l'agent chargé des résumés de compaction.
 const SUMMARIZER_PREAMBLE: &str = "Tu résumes fidèlement des conversations d'agent, sans rien inventer.";
@@ -62,46 +64,76 @@ pub struct Ask(pub String);
 #[rtype(result = "()")]
 pub struct Reset(pub AppConfig);
 
+/// Demande le mode d'appel d'outils retenu (après détection éventuelle).
+#[derive(Message)]
+#[rtype(result = "ToolMode")]
+pub struct GetToolMode;
+
 /// Acteur détenant l'agent, son journal de session et l'historique de la conversation.
 pub struct AgentActor {
+    /// Agent à appel d'outils natif (outils et garde-fous branchés sur rig).
     agent: Agent,
+    /// Agent du mode texte : sans outils déclarés, mode d'emploi des balises dans le prompt.
+    text_agent: Agent,
     summarizer: Agent,
+    guard: Guard,
+    max_turns: usize,
+    /// Mode retenu ; `Auto` jusqu'à la fin de la détection.
+    tool_mode: ToolMode,
+    /// Serveur et modèle, pour la détection du mode.
+    ollama_url: String,
+    model: String,
     timeout: Duration,
     context_tokens: usize,
     session: SessionStore,
     approvals: UnboundedSender<Approval>,
+    workspace: Workspace,
     history: Vec<Message>,
 }
 
 impl AgentActor {
-    /// Construit l'agent et rejoue le journal de session pour reprendre la conversation.
+    /// Prépare le répertoire de travail, construit l'agent et rejoue le journal de session.
     /// Les demandes d'autorisation des garde-fous partent sur `approvals`.
     pub fn new(cfg: &AppConfig, approvals: UnboundedSender<Approval>) -> std::io::Result<Self> {
-        let mut actor = Self::build(cfg, approvals);
+        let workspace = Workspace::new(&cfg.workspace)?;
+        let mut actor = Self::build(cfg, approvals, workspace);
         actor.history = actor.session.replay()?;
         Ok(actor)
     }
 
     /// Construit un agent neuf, historique vide : prompt assemblé, outils, garde-fous, plafond de boucle.
-    fn build(cfg: &AppConfig, approvals: UnboundedSender<Approval>) -> Self {
+    /// Le répertoire de travail, fixé au démarrage, est conservé tel quel.
+    fn build(cfg: &AppConfig, approvals: UnboundedSender<Approval>, workspace: Workspace) -> Self {
         let ollama = OllamaConfig::new().with_base_url(&cfg.ollama_url).client();
-        let cwd = std::env::current_dir().unwrap_or_default();
+        let preamble = prompt::assemble(&cfg.preamble, workspace.root());
+        let guard = Guard::new(approvals.clone(), cfg.auto_approve);
+        let text_agent =
+            AgentBuilder::new(ollama.completion(&cfg.model)).preamble(format!("{preamble}\n\n{}", text::INSTRUCTIONS)).build();
         let agent = AgentBuilder::new(ollama.completion(&cfg.model))
-            .preamble(prompt::assemble(&cfg.preamble, &cwd))
+            .preamble(preamble)
             .default_max_turns(cfg.max_turns)
-            .add_hook(Guard::new(approvals.clone(), cfg.auto_approve))
-            .tool(ReadFile)
-            .tool(WriteFile)
-            .tool(RunBash)
+            .add_hook(guard.clone())
+            .tool(ListDir(workspace.clone()))
+            .tool(ReadFile(workspace.clone()))
+            .tool(EditFile(workspace.clone()))
+            .tool(WriteFile(workspace.clone()))
+            .tool(RunBash(workspace.clone()))
             .build();
         let summarizer = AgentBuilder::new(ollama.completion(&cfg.model)).preamble(SUMMARIZER_PREAMBLE).build();
         Self {
             agent,
+            text_agent,
             summarizer,
+            guard,
+            max_turns: cfg.max_turns,
+            tool_mode: cfg.tool_mode,
+            ollama_url: cfg.ollama_url.clone(),
+            model: cfg.model.clone(),
             timeout: Duration::from_secs(cfg.answer_timeout_secs),
             context_tokens: cfg.context_tokens,
             session: SessionStore::new(&cfg.session_file),
             approvals,
+            workspace,
             history: Vec::new(),
         }
     }
@@ -117,8 +149,31 @@ async fn compact_if_needed(summarizer: &Agent, history: &mut Vec<Message>, conte
     Some(history.clone())
 }
 
+impl AgentActor {
+    /// Résout le mode d'appel d'outils avant de traiter tout autre message
+    /// (`ctx.wait` suspend la boîte aux lettres pendant la détection).
+    fn detect_tool_mode(&mut self, ctx: &mut Context<Self>) {
+        let detection = probe::resolve(self.tool_mode, self.ollama_url.clone(), self.model.clone());
+        ctx.wait(detection.into_actor(self).map(|mode, act, _| act.tool_mode = mode));
+    }
+}
+
 impl Actor for AgentActor {
     type Context = Context<Self>;
+
+    /// Au démarrage : détection du mode d'appel d'outils.
+    fn started(&mut self, ctx: &mut Self::Context) {
+        self.detect_tool_mode(ctx);
+    }
+}
+
+impl Handler<GetToolMode> for AgentActor {
+    type Result = MessageResult<GetToolMode>;
+
+    /// Renvoie le mode retenu.
+    fn handle(&mut self, _: GetToolMode, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult(self.tool_mode)
+    }
 }
 
 impl Handler<Ask> for AgentActor {
@@ -127,17 +182,22 @@ impl Handler<Ask> for AgentActor {
     /// Compacte le contexte si besoin, lance la boucle d'agent (outils compris) puis journalise
     /// les nouveaux messages. `AtomicResponse` sérialise les tours et garde l'historique cohérent.
     fn handle(&mut self, Ask(prompt): Ask, _ctx: &mut Self::Context) -> Self::Result {
-        let (agent, summarizer) = (self.agent.clone(), self.summarizer.clone());
-        let (timeout, context_tokens) = (self.timeout, self.context_tokens);
+        let (agent, text_agent, summarizer) = (self.agent.clone(), self.text_agent.clone(), self.summarizer.clone());
+        let (guard, workspace, max_turns) = (self.guard.clone(), self.workspace.clone(), self.max_turns);
+        let (timeout, context_tokens, native) = (self.timeout, self.context_tokens, self.tool_mode == ToolMode::Native);
         let mut history = std::mem::take(&mut self.history);
         let fut = async move {
             let compaction = compact_if_needed(&summarizer, &mut history, context_tokens).await;
             let before = history.len();
             // En cas d'erreur, rig laisse `history` inchangé.
-            let res = match tokio::time::timeout(timeout, agent.chat(prompt, &mut history)).await {
-                Ok(r) => r.map(|r| r.output()).map_err(AgentError::from),
-                Err(_) => Err(AgentError::Timeout),
+            let run = async {
+                if native {
+                    agent.chat(prompt, &mut history).await.map(|r| r.output()).map_err(AgentError::from)
+                } else {
+                    text_loop::chat(&text_agent, &guard, &workspace, max_turns, prompt, &mut history).await
+                }
             };
+            let res = tokio::time::timeout(timeout, run).await.unwrap_or(Err(AgentError::Timeout));
             (compaction, before, res, history)
         };
         AtomicResponse::new(Box::pin(fut.into_actor(self).map(
@@ -157,11 +217,13 @@ impl Handler<Ask> for AgentActor {
 impl Handler<Reset> for AgentActor {
     type Result = ();
 
-    /// Repart d'un agent neuf : nouvelle configuration, historique vide, remise à zéro journalisée.
-    fn handle(&mut self, Reset(cfg): Reset, _ctx: &mut Self::Context) {
-        *self = Self::build(&cfg, self.approvals.clone());
+    /// Repart d'un agent neuf : nouvelle configuration, historique vide, remise à zéro journalisée,
+    /// puis nouvelle détection du mode d'appel d'outils (le modèle a pu changer).
+    fn handle(&mut self, Reset(cfg): Reset, ctx: &mut Self::Context) {
+        *self = Self::build(&cfg, self.approvals.clone(), self.workspace.clone());
         // Échec d'écriture non bloquant : au pire, l'ancienne conversation sera rejouée au redémarrage.
         let _ = self.session.append(Event::Reset);
+        self.detect_tool_mode(ctx);
     }
 }
 
@@ -170,7 +232,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
-    use crate::harness::tools::Permission;
+    use crate::tools::Permission;
     use crate::test_support::{start_agent, test_config};
 
     /// Raccourci : envoie `content` à l'agent et aplatit les erreurs.
@@ -230,7 +292,7 @@ mod tests {
         let cfg = test_config();
         let agent = AgentActor::create(|ctx| {
             ctx.stop();
-            AgentActor::build(&cfg, unbounded_channel().0)
+            AgentActor::build(&cfg, unbounded_channel().0, Workspace::new(&cfg.workspace).unwrap())
         });
         assert!(matches!(say(&agent, "un").await, Err(AgentError::Mailbox(_))));
     }
@@ -260,6 +322,31 @@ mod tests {
         let workspace = AppConfig { auto_approve: Permission::Workspace, ..test_config() };
         let agent = AgentActor::new(&workspace, unbounded_channel().0).unwrap().start();
         assert!(say(&agent, "OUTIL true").await.unwrap().contains("code de sortie : 0"));
+    }
+
+    /// Mode texte : la balise du modèle est exécutée et son résultat lui est renvoyé ;
+    /// les garde-fous s'appliquent (un appel non autorisé est refusé).
+    #[actix_web::test]
+    async fn text_mode_runs_tags_through_guard() {
+        let cfg = AppConfig { tool_mode: ToolMode::Text, ..test_config() };
+        let agent = AgentActor::new(&cfg, unbounded_channel().0).unwrap().start();
+        let reply = say(&agent, "OUTIL echo bonjour").await.unwrap();
+        assert!(reply.starts_with("outil : <result tool=\"run_bash\">\ncode de sortie : 0\nbonjour"), "{reply}");
+        let reply = say(&agent, "OUTIL touch fichier-interdit").await.unwrap();
+        assert!(reply.contains("refusé par l'utilisateur"), "{reply}");
+        assert!(!std::path::Path::new("fichier-interdit").exists());
+    }
+
+    /// Mode `auto` : détecté au démarrage puis à chaque `Reset` (le modèle a pu changer).
+    #[actix_web::test]
+    async fn tool_mode_is_detected_on_start_and_reset() {
+        let cfg = AppConfig { tool_mode: ToolMode::Auto, ..test_config() };
+        let agent = AgentActor::new(&cfg, unbounded_channel().0).unwrap().start();
+        assert_eq!(agent.send(GetToolMode).await.unwrap(), ToolMode::Native);
+        agent.send(Reset(AppConfig { model: "tronque".into(), ..cfg })).await.unwrap();
+        assert_eq!(agent.send(GetToolMode).await.unwrap(), ToolMode::Text);
+        let reply = say(&agent, "OUTIL echo bonjour").await.unwrap();
+        assert!(reply.contains("<result tool=\"run_bash\">"), "{reply}");
     }
 
     /// Le même appel répété arrête l'exécution ; le plafond d'itérations aussi.

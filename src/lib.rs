@@ -5,5 +5,6 @@ pub mod agent_actor;
 pub mod cli_ui;
 pub mod config;
 pub mod harness;
+pub mod tools;
 #[cfg(test)]
 mod test_support;
