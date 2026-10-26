@@ -1,9 +1,12 @@
 //! Répertoire de travail de l'agent : tout chemin donné par le modèle y est résolu et doit y rester,
 //! y compris à travers les liens symboliques. Les fichiers du harness (configuration, journaux)
 //! y sont interdits, pour que l'agent ne puisse ni élargir ses permissions ni falsifier sa session.
+//! Le répertoire porte aussi le bac à sable des commandes shell.
 
 use std::io;
 use std::path::{Path, PathBuf};
+
+use super::Sandbox;
 
 /// Racine canonique (liens résolus) dans laquelle les outils sont confinés.
 #[derive(Clone, Debug)]
@@ -11,13 +14,26 @@ pub struct Workspace {
     root: PathBuf,
     /// Chemins réels interdits aux outils.
     protected: Vec<PathBuf>,
+    /// Isolation de `run_bash` (`strict` par défaut).
+    sandbox: Sandbox,
 }
 
 impl Workspace {
     /// Crée le répertoire s'il manque et retient sa forme canonique.
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root: root.as_ref().canonicalize()?, protected: Vec::new() })
+        Ok(Self { root: root.as_ref().canonicalize()?, protected: Vec::new(), sandbox: Sandbox::default() })
+    }
+
+    /// Choisit l'isolation des commandes shell.
+    pub fn sandboxed(mut self, sandbox: Sandbox) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// Isolation des commandes shell.
+    pub fn sandbox(&self) -> Sandbox {
+        self.sandbox
     }
 
     /// Interdit aux outils les fichiers `paths` (relatifs au répertoire courant du programme).

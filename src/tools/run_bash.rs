@@ -1,11 +1,11 @@
 //! Outil `run_bash` : exécute une commande shell à la racine du répertoire de travail,
-//! et classe chaque commande par niveau de permission.
+//! dans le bac à sable configuré, et classe chaque commande par niveau de permission.
 
 use rig_core::tool::PortableTool;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Permission, Workspace, truncate};
+use super::{Permission, Sandbox, Workspace, sandbox, truncate};
 
 /// Commandes en lecture seule (classées d'après leur premier mot).
 /// `find` n'y figure pas : `-delete` / `-exec` le rendent destructif.
@@ -54,7 +54,9 @@ impl PortableTool for RunBash {
 
     /// Description montrée au modèle.
     fn description(&self) -> String {
-        "Exécute une commande avec `sh -c` à la racine du répertoire de travail et renvoie son code et sa sortie.".into()
+        "Exécute une commande avec `sh -c` à la racine du répertoire de travail et renvoie son code et sa sortie. \
+         Écriture limitée au répertoire de travail ; selon la configuration, pas de réseau."
+            .into()
     }
 
     /// Schéma JSON des arguments.
@@ -62,15 +64,19 @@ impl PortableTool for RunBash {
         json!({"type": "object", "properties": {"command": {"type": "string", "description": "commande shell"}}, "required": ["command"]})
     }
 
-    /// Lance la commande ; elle est tuée si l'exécution de l'agent est abandonnée (délai dépassé).
+    /// Lance la commande dans le bac à sable ; elle est tuée si l'exécution de l'agent est
+    /// abandonnée (délai dépassé). Bac à sable introuvable : erreur explicite, jamais d'exécution sans.
     async fn call(&self, args: BashArgs) -> std::io::Result<String> {
-        let out = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&args.command)
-            .current_dir(self.0.root())
-            .kill_on_drop(true)
-            .output()
-            .await?;
+        let mode = self.0.sandbox();
+        let mut cmd = sandbox::command(mode, self.0.root(), &args.command);
+        let out = cmd.output().await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound if mode != Sandbox::Off => {
+                let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+                let msg = format!("bac à sable indisponible ({program} introuvable) : installez-le ou mettez sandbox = \"off\"");
+                std::io::Error::new(e.kind(), msg)
+            }
+            _ => e,
+        })?;
         let code = out.status.code().map_or("aucun (signal)".into(), |c| c.to_string());
         let text = format!(
             "code de sortie : {code}\n{}{}",
@@ -85,6 +91,31 @@ impl PortableTool for RunBash {
 mod tests {
     use super::*;
     use crate::tools::temp_workspace;
+
+    /// Bac à sable (macOS) : écriture limitée au répertoire de travail, réseau coupé en mode `strict`,
+    /// autorisé en mode `network` ; sans bac à sable, rien n'est limité.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_confines_writes_and_network() {
+        let ws = temp_workspace("sandbox");
+        let outside = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/essai-bac-a-sable");
+        let _ = std::fs::remove_file(&outside);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let run = |mode: Sandbox, command: String| {
+            let tool = RunBash(ws.clone().sandboxed(mode));
+            async move { tool.call(serde_json::from_value(json!({"command": command})).unwrap()).await.unwrap() }
+        };
+        let connect = format!("nc -z -w 2 127.0.0.1 {port}");
+
+        assert!(run(Sandbox::Strict, "touch interne && ls".into()).await.contains("interne"));
+        let denied = run(Sandbox::Strict, format!("touch {}", outside.display())).await;
+        assert!(denied.contains("Operation not permitted") && !outside.exists(), "{denied}");
+        assert!(!run(Sandbox::Strict, connect.clone()).await.starts_with("code de sortie : 0"));
+        assert!(run(Sandbox::Network, connect).await.starts_with("code de sortie : 0"));
+        assert!(run(Sandbox::Off, format!("touch {}", outside.display())).await.starts_with("code de sortie : 0"));
+        std::fs::remove_file(&outside).unwrap();
+    }
 
     /// Classement des commandes : lecture, écriture locale, destruction, composition, sortie du répertoire.
     #[test]

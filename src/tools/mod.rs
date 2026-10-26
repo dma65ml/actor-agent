@@ -5,6 +5,7 @@ mod edit_file;
 mod list_dir;
 mod read_file;
 mod run_bash;
+mod sandbox;
 pub mod text;
 mod workspace;
 mod write_file;
@@ -16,6 +17,7 @@ pub use edit_file::EditFile;
 pub use list_dir::ListDir;
 pub use read_file::ReadFile;
 pub use run_bash::RunBash;
+pub use sandbox::Sandbox;
 pub use workspace::Workspace;
 pub use write_file::WriteFile;
 

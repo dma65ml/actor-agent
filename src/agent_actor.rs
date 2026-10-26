@@ -93,7 +93,7 @@ impl AgentActor {
     /// Les demandes d'autorisation des garde-fous partent sur `approvals`.
     pub fn new(cfg: &AppConfig, approvals: UnboundedSender<Approval>) -> std::io::Result<Self> {
         let protected = [CONFIG_FILE, cfg.session_file.as_str(), cfg.history_file.as_str()];
-        let workspace = Workspace::new(&cfg.workspace)?.protecting(protected);
+        let workspace = Workspace::new(&cfg.workspace)?.protecting(protected).sandboxed(cfg.sandbox);
         let mut actor = Self::build(cfg, approvals, workspace);
         actor.history = actor.session.replay()?;
         Ok(actor)

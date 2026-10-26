@@ -8,7 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::harness::probe::ToolMode;
-use crate::tools::Permission;
+use crate::tools::{Permission, Sandbox};
 
 /// Fichier de configuration lu (s'il existe) dans le répertoire courant.
 pub const CONFIG_FILE: &str = "config.toml";
@@ -48,6 +48,9 @@ pub struct AppConfig {
     pub workspace: String,
     /// Mode d'appel d'outils : `auto` (détecté au démarrage), `native` ou `text`.
     pub tool_mode: ToolMode,
+    /// Bac à sable de `run_bash` : `strict` (écriture dans le répertoire de travail, sans réseau),
+    /// `network` (avec réseau) ou `off`.
+    pub sandbox: Sandbox,
     /// Niveau de permission accordé sans confirmation (`read`, `workspace` ou `full`).
     pub auto_approve: Permission,
 }
@@ -69,6 +72,7 @@ impl Default for AppConfig {
             history_file: ".actor-agent-history.jsonl".into(),
             workspace: "workspace".into(),
             tool_mode: ToolMode::Auto,
+            sandbox: Sandbox::Strict,
             auto_approve: Permission::Read,
         }
     }
@@ -143,10 +147,10 @@ mod tests {
     #[test]
     fn existing_file_is_read() {
         let path = temp_dir("existing").join(CONFIG_FILE);
-        std::fs::write(&path, "model = \"qwen\"\nauto_approve = \"workspace\"\nworkspace = \"ws\"\ntool_mode = \"text\"").unwrap();
+        std::fs::write(&path, "model = \"qwen\"\nauto_approve = \"workspace\"\nworkspace = \"ws\"\ntool_mode = \"text\"\nsandbox = \"network\"").unwrap();
         let cfg = AppConfig::load_from(&path, env(&[])).unwrap();
         assert_eq!((cfg.model.as_str(), cfg.auto_approve), ("qwen", Permission::Workspace));
-        assert_eq!((cfg.workspace.as_str(), cfg.tool_mode), ("ws", ToolMode::Text));
+        assert_eq!((cfg.workspace.as_str(), cfg.tool_mode, cfg.sandbox), ("ws", ToolMode::Text, Sandbox::Network));
         assert_eq!(cfg.answer_timeout_secs, AppConfig::default().answer_timeout_secs);
     }
 

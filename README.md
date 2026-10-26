@@ -38,6 +38,7 @@ Chaque source remplace la précédente, dans cet ordre :
 | `session_file`        | —                        | `.actor-agent-session.jsonl`                      |
 | `history_file`        | —                        | `.actor-agent-history.jsonl` (messages envoyés, rappelés d'une séance à l'autre) |
 | `workspace`           | —                        | `workspace` (répertoire de travail, créé s'il manque) |
+| `sandbox` (`strict`, `network`, `off`) | — | `strict` (bac à sable de `run_bash`, voir plus bas) |
 | `tool_mode` (`auto`, `native`, `text`) | — | `auto` (détecté au démarrage et à chaque `/clear`) |
 | `auto_approve` (`read`, `workspace`, `full`) | — | `read`                                          |
 
@@ -94,17 +95,31 @@ La boucle d'agent est celle de rig (`agent.chat` avec `default_max_turns`) : le 
 | `read_file(path)` | lit un fichier texte | `read` |
 | `edit_file(path, old_str, new_str)` | remplace un passage qui doit apparaître exactement une fois | `workspace` |
 | `write_file(path, content)` | crée ou remplace un fichier (répertoires parents créés) | `workspace` |
-| `run_bash(command)` | `sh -c` à la racine du répertoire de travail, renvoie le code de sortie et les sorties | `read` pour `ls cat grep echo pwd head tail` ; `full` pour `rm sudo shutdown reboot mkfs dd`, toute commande contenant `; \| & $ \` < > ( ) { }` ou un saut de ligne, ou un argument commençant par `/` ou `~` ou contenant `..` ; `workspace` sinon |
+| `run_bash(command)` | `sh -c` à la racine du répertoire de travail, dans le bac à sable, renvoie le code de sortie et les sorties | `read` pour `ls cat grep echo pwd head tail` ; `full` pour `rm sudo shutdown reboot mkfs dd`, toute commande contenant `; \| & $ \` < > ( ) { }` ou un saut de ligne, ou un argument commençant par `/` ou `~` ou contenant `..` ; `workspace` sinon |
 
 Les chemins des outils de fichiers sont relatifs au répertoire de travail. Un chemin qui en sort (absolu, `..`, lien symbolique vers l'extérieur) est refusé, quelle que soit la permission : le modèle reçoit l'erreur. Des arguments illisibles ou un outil inconnu demandent le niveau `full`. Une sortie de plus de 20 000 caractères est tronquée. Un appel refusé n'est pas exécuté : le modèle reçoit « refusé par l'utilisateur » et peut continuer.
 
 Par défaut (`auto_approve = "read"`), seules les lectures s'exécutent sans demander. `auto_approve = "workspace"` reproduit le choix de l'article : toute commande non destructive s'exécute alors directement.
 
-Limites de sécurité, faute de bac à sable pour `run_bash` (son classement est lexical, et une commande autorisée tourne avec vos droits) :
+### Bac à sable de `run_bash`
 
-- **`workspace` équivaut à une confiance totale** : toute commande inconnue (`python3`, `curl`, `cargo build`…) relève de ce niveau ; l'agent peut écrire un script avec `write_file` puis l'exécuter sans rien demander, et ce script peut tout faire (lire `~/.ssh`, accéder au réseau).
-- **Liens symboliques et `run_bash`** : les outils de fichiers suivent les liens et refusent ceux qui sortent du répertoire de travail, mais pas `run_bash` : `cat lien/etc/passwd` passe au niveau `read` si `lien` pointe vers `/` (créer le lien demande, lui, le niveau `workspace`).
-- **Fichiers du harness** : `config.toml`, le journal de session et l'historique des messages sont interdits aux outils de fichiers s'ils se trouvent dans le répertoire de travail (sinon l'agent pourrait élargir ses permissions ou falsifier sa session) ; `run_bash` reste soumis aux seules permissions.
+Le classement des commandes est lexical, donc contournable (un script écrit avec `write_file` puis exécuté peut tout faire). Le bac à sable, lui, est imposé par le système d'exploitation :
+
+| `sandbox` | Écriture | Réseau | Lecture |
+|-----------|----------|--------|---------|
+| `strict` (défaut) | répertoire de travail, `/dev`, répertoires temporaires | coupé | libre |
+| `network` | idem | autorisé (`pip install`, `cargo fetch`…) | libre |
+| `off` | partout (vos droits) | autorisé | libre |
+
+- macOS : `sandbox-exec` (fourni avec le système) ; Linux : `bwrap` (paquet `bubblewrap`, variante non testée). Bac à sable introuvable : la commande est refusée avec un message, jamais exécutée sans.
+- La lecture reste libre (chaînes d'outils dans le dossier personnel) : le modèle étant local, une lecture ne peut sortir de la machine que par le réseau, coupé en `strict`. En `network`, une commande peut lire `~/.ssh` et l'envoyer : réservez ce mode aux tâches qui en ont besoin.
+- Avec `strict`, `auto_approve = "workspace"` devient raisonnable : une commande ne peut abîmer que le répertoire de travail. Avec `off`, ce niveau équivaut à une confiance totale.
+- Les permissions restent appliquées en amont, bac à sable ou non.
+
+Autres limites :
+
+- **Fichiers du harness** : `config.toml`, le journal de session et l'historique des messages sont interdits aux outils de fichiers s'ils se trouvent dans le répertoire de travail (sinon l'agent pourrait élargir ses permissions ou falsifier sa session). `run_bash` peut les modifier s'ils y sont : gardez le répertoire de travail à part (défaut `workspace`).
+- **Liens symboliques et `run_bash`** : `cat lien/etc/passwd` passe au niveau `read` si `lien` pointe vers `/` ; c'est une lecture, libre dans le bac à sable.
 
 ### Compatibilité multi-modèles
 
@@ -155,7 +170,7 @@ Le cœur est une bibliothèque (`src/lib.rs`) ; le binaire ne fait que l'assembl
 | `config.rs`      | `AppConfig` : chargement depuis les défauts, `config.toml` et l'environnement |
 | `agent_actor.rs` | `AgentActor` : assemble le harness, historique, délai ; messages `Ask` et `Reset` |
 | `harness/`       | `prompt.rs` (prompt système), `session.rs` (journal), `guard.rs` (garde-fous), `compact.rs` (compaction), `probe.rs` (détection du mode d'outils), `text_loop.rs` (boucle du mode texte) |
-| `tools/`         | un fichier par outil, `workspace.rs` (confinement des chemins), `text.rs` (format à balises), `mod.rs` (permissions) |
+| `tools/`         | un fichier par outil, `workspace.rs` (confinement des chemins), `sandbox.rs` (bac à sable de `run_bash`), `text.rs` (format à balises), `mod.rs` (permissions) |
 | `cli_ui/`        | TUI ratatui, jamais bloqué pendant la génération : `mod.rs` (boucle d'événements), `app.rs` (état, touches), `input.rs` (édition multiligne), `history.rs` (messages envoyés persistants), `draw.rs` (rendu), `tests.rs` |
 | `lib.rs`         | expose les modules ci-dessus                                         |
 | `main.rs`        | chargement de la config, démarrage de l'agent et du TUI              |
